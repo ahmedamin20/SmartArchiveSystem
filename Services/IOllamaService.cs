@@ -5,6 +5,6 @@ namespace SmartArchive.Services
 {
     public interface IOllamaService
     {
-        Task<ExtractionResponse?> ExtractTextFromImageAsync(string base64Image);
+        Task<(ExtractionResponse? Extraction, string? Error)> ExtractTextFromImageAsync(string base64Image);
     }
 }

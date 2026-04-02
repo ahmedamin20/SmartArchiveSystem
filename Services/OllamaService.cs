@@ -3,6 +3,8 @@ using System.Net.Http;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 using SmartArchive.DTOs;
 
 namespace SmartArchive.Services
@@ -12,81 +14,135 @@ namespace SmartArchive.Services
     {
         private readonly HttpClient _http;
         private readonly JsonSerializerOptions _jsonOptions;
+        private readonly ILogger<OllamaService> _log;
+        private readonly string _model;
 
-        public OllamaService(HttpClient httpClient)
+        public OllamaService(HttpClient httpClient, IConfiguration configuration, ILogger<OllamaService> log)
         {
             _http = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
             _jsonOptions = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+            _log = log;
+            _model = configuration["OllamaModel"] ?? "llava:latest";
         }
 
-        public async Task<ExtractionResponse?> ExtractTextFromImageAsync(string base64Image)
+        public async Task<(ExtractionResponse? Extraction, string? Error)> ExtractTextFromImageAsync(string base64Image)
         {
-            if (string.IsNullOrWhiteSpace(base64Image)) return null;
+            if (string.IsNullOrWhiteSpace(base64Image))
+                return (null, "Image payload is empty");
 
             try
             {
-                // Payload schema depends on local model's expected input. Keep this straightforward and safe.
+                const string prompt = "Extract National ID and full name from this ID image. Return ONLY valid JSON with exactly: {\"nationalId\":\"...\",\"fullName\":\"...\"}. If not readable, return empty strings.";
+
                 var payload = new
                 {
-                    model = "llama3-vision",
-                    input = new
-                    {
-                        // many local llama servers expect either `image` or `data` fields; adapt if needed.
-                        image = base64Image
-                    }
+                    model = _model,
+                    prompt,
+                    images = new[] { base64Image },
+                    stream = false,
+                    format = "json"
                 };
 
                 var json = JsonSerializer.Serialize(payload, _jsonOptions);
                 using var content = new StringContent(json, Encoding.UTF8, "application/json");
 
-                // Assumed endpoint for local Ollama. Adjust `BaseAddress` on HttpClient in Program.cs if different.
                 using var response = await _http.PostAsync("/api/generate", content);
-                response.EnsureSuccessStatusCode();
-
                 var responseJson = await response.Content.ReadAsStringAsync();
-                // The local model output format may vary. Try to parse the most common shapes.
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    _log.LogWarning("Ollama returned {StatusCode}. Body: {Body}", (int)response.StatusCode, responseJson);
+                    return (null, $"Ollama call failed with status {(int)response.StatusCode}. Ensure model '{_model}' exists and Ollama is running.");
+                }
+
                 using var doc = JsonDocument.Parse(responseJson);
                 var root = doc.RootElement;
 
-                // Try common flattened properties first
-                if (root.TryGetProperty("nationalId", out var nidProp) || root.TryGetProperty("national_id", out nidProp))
-                {
-                    var nid = nidProp.GetString() ?? string.Empty;
-                    string fullName = string.Empty;
-                    if (root.TryGetProperty("fullName", out var fnProp) || root.TryGetProperty("full_name", out fnProp))
-                        fullName = fnProp.GetString() ?? string.Empty;
+                if (!root.TryGetProperty("response", out var modelResponseProp) || modelResponseProp.ValueKind != JsonValueKind.String)
+                    return (null, "Ollama returned an unexpected response shape");
 
-                    return new ExtractionResponse(nid, fullName);
+                var modelResponseText = modelResponseProp.GetString() ?? string.Empty;
+                if (string.IsNullOrWhiteSpace(modelResponseText))
+                    return (null, "Ollama returned empty text");
+
+                var jsonText = ExtractJsonObject(modelResponseText);
+                if (string.IsNullOrWhiteSpace(jsonText))
+                {
+                    _log.LogInformation("Model response did not contain JSON object. Raw: {Raw}", modelResponseText);
+                    return (null, "Model output was not valid JSON");
                 }
 
-                // Fallback: search text blocks for patterns (very conservative)
-                if (root.ValueKind == JsonValueKind.Object)
+                using var extractedDoc = JsonDocument.Parse(jsonText);
+                var extracted = extractedDoc.RootElement;
+
+                var nationalId = GetString(extracted, "nationalId", "national_id", "id", "nationalid");
+                var fullName = GetString(extracted, "fullName", "full_name", "name");
+
+                if (string.IsNullOrWhiteSpace(nationalId) && string.IsNullOrWhiteSpace(fullName))
                 {
-                    foreach (var prop in root.EnumerateObject())
-                    {
-                        if (prop.Value.ValueKind == JsonValueKind.String)
-                        {
-                            var v = prop.Value.GetString() ?? string.Empty;
-                            if (v.Contains("NationalId", StringComparison.OrdinalIgnoreCase) || v.Length >= 6)
-                            {
-                                // best-effort - this is speculative. Prefer model to return structured json.
-                                return new ExtractionResponse(v, string.Empty);
-                            }
-                        }
-                    }
+                    _log.LogInformation("Parsed JSON but fields were empty. JSON: {Json}", jsonText);
+                    return (null, "Could not extract readable National ID or full name from the image");
                 }
 
-                return null;
+                return (new ExtractionResponse(nationalId ?? string.Empty, fullName ?? string.Empty), null);
             }
-            catch (HttpRequestException)
+            catch (HttpRequestException ex)
             {
-                // bubble up as null for caller to handle
-                return null;
+                _log.LogError(ex, "Failed to connect to Ollama at {BaseAddress}", _http.BaseAddress);
+                return (null, "Cannot connect to Ollama. Ensure Ollama is running on the configured URL.");
             }
-            catch (Exception)
+            catch (JsonException ex)
             {
-                return null;
+                _log.LogError(ex, "Failed to parse Ollama response");
+                return (null, "Failed to parse model response");
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "Unexpected error during OCR extraction");
+                return (null, "Unexpected error during extraction");
             }
         }
+
+        private static string? GetString(JsonElement element, params string[] names)
+        {
+            foreach (var name in names)
+            {
+                if (TryGetPropertyIgnoreCase(element, name, out var prop) && prop.ValueKind == JsonValueKind.String)
+                {
+                    return prop.GetString();
+                }
+            }
+
+            return null;
+        }
+
+        private static bool TryGetPropertyIgnoreCase(JsonElement element, string name, out JsonElement value)
+        {
+            foreach (var p in element.EnumerateObject())
+            {
+                if (string.Equals(p.Name, name, StringComparison.OrdinalIgnoreCase))
+                {
+                    value = p.Value;
+                    return true;
+                }
+            }
+
+            value = default;
+            return false;
+        }
+
+        private static string? ExtractJsonObject(string text)
+        {
+            var trimmed = text.Trim();
+            if (trimmed.StartsWith("{") && trimmed.EndsWith("}"))
+                return trimmed;
+
+            var start = trimmed.IndexOf('{');
+            var end = trimmed.LastIndexOf('}');
+            if (start >= 0 && end > start)
+                return trimmed.Substring(start, end - start + 1);
+
+            return null;
+            }
     }
 }

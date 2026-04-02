@@ -55,7 +55,22 @@ namespace SmartArchive.Services
                 await fs.CopyToAsync(ms);
                 var base64 = Convert.ToBase64String(ms.ToArray());
 
-                var extraction = await _ollama.ExtractTextFromImageAsync(base64);
+                var (extraction, extractionError) = await _ollama.ExtractTextFromImageAsync(base64);
+                if (extraction == null)
+                {
+                    try
+                    {
+                        if (File.Exists(tempFileName))
+                            File.Delete(tempFileName);
+                    }
+                    catch
+                    {
+                        // Best effort cleanup for failed analysis.
+                    }
+
+                    return (null, null, extractionError ?? "Failed to extract data from image");
+                }
+
                 return (extraction, tempFileName, null);
             }
             catch (IOException ioEx)

@@ -5,6 +5,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using SmartArchive.Data;
 using SmartArchive.Services;
+using SmartArchive.Filters;
 
 var builder = WebApplication.CreateBuilder(args);
 var services = builder.Services;
@@ -38,7 +39,11 @@ services.AddControllers().AddJsonOptions(opts =>
 });
 
 services.AddEndpointsApiExplorer();
-services.AddSwaggerGen();
+services.AddSwaggerGen(opts =>
+{
+    opts.SchemaFilter<FormFileSchemaFilter>();
+    opts.OperationFilter<FileUploadOperationFilter>();
+});
 
 var app = builder.Build();
 

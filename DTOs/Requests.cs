@@ -5,6 +5,11 @@ namespace SmartArchive.DTOs
 {
     public record ExtractionResponse(string NationalId, string FullName);
 
+    public class AnalyzeRequest
+    {
+        public required IFormFile File { get; set; }
+    }
+
     public class ConfirmUploadRequest
     {
         public required string NationalId { get; set; }

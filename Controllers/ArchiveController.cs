@@ -20,11 +20,12 @@ namespace SmartArchive.Controllers
         }
 
         [HttpPost("analyze")]
-        public async Task<IActionResult> Analyze([FromForm] Microsoft.AspNetCore.Http.IFormFile file)
+        [Consumes("multipart/form-data")]
+        public async Task<IActionResult> Analyze([FromForm] AnalyzeRequest request)
         {
             try
             {
-                var (extraction, tempPath, error) = await _archive.AnalyzeAsync(file);
+                var (extraction, tempPath, error) = await _archive.AnalyzeAsync(request.File);
                 if (!string.IsNullOrEmpty(error))
                     return BadRequest(new { error });
 

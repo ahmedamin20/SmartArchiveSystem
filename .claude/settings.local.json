@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dotnet build:*)",
+      "Bash(netstat -ano)",
+      "Bash(taskkill /PID 16412 /F)"
+    ]
+  }
+}
